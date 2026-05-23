@@ -91,6 +91,10 @@ To overwrite the old split photos, run:
 splitted --force
 ```
 
+If you installed an older version and the left photo looked like the middle of
+the original image, run the Quick Install command again, open a new Terminal
+window, then run `splitted --force`.
+
 ## Other Install Option
 
 If the quick install command feels too weird, you can download the project:

@@ -232,6 +232,7 @@ process_file() {
   local file="$1"
   local metadata width height left_width right_width
   local relative relative_dir dest_dir name base ext left_out right_out
+  local temp_dir flipped_source flipped_left
 
   file="${file:a}"
 
@@ -300,7 +301,19 @@ process_file() {
     return 0
   }
 
-  if sips --cropOffset 0 0 --cropToHeightWidth "$height" "$left_width" "$file" --out "$left_out" >/dev/null \
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/splitted.XXXXXX")" || {
+    warn "Could not create a temporary folder."
+    (( failed++ ))
+    return 0
+  }
+  flipped_source="$temp_dir/source_flipped.$ext"
+  flipped_left="$temp_dir/left_flipped.$ext"
+
+  # sips centers left-edge crops. Flipping lets us crop from the right edge,
+  # where cropOffset behaves predictably, then flip the left result back.
+  if sips --flip horizontal "$file" --out "$flipped_source" >/dev/null \
+    && sips --cropOffset 0 "$right_width" --cropToHeightWidth "$height" "$left_width" "$flipped_source" --out "$flipped_left" >/dev/null \
+    && sips --flip horizontal "$flipped_left" --out "$left_out" >/dev/null \
     && sips --cropOffset 0 "$left_width" --cropToHeightWidth "$height" "$right_width" "$file" --out "$right_out" >/dev/null; then
     print -- "Split ${file:t} -> ${left_out:t}, ${right_out:t}"
     (( split++ ))
@@ -308,6 +321,8 @@ process_file() {
     warn "Failed to split: $file"
     (( failed++ ))
   fi
+
+  rm -rf "$temp_dir"
 }
 
 for image_file in "${image_files[@]}"; do
