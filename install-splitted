@@ -1,0 +1,60 @@
+#!/bin/zsh
+
+set -u
+set -o pipefail
+
+program="${0:t}"
+install_dir="$HOME/.local/bin"
+target="$install_dir/splitted"
+profile="$HOME/.zshrc"
+path_line='export PATH="$HOME/.local/bin:$PATH"'
+repo_owner="${SPLITTED_REPO_OWNER:-Nic0S}"
+repo_name="${SPLITTED_REPO_NAME:-splitted}"
+repo_branch="${SPLITTED_REPO_BRANCH:-main}"
+download_url="${SPLITTED_DOWNLOAD_URL:-https://raw.githubusercontent.com/$repo_owner/$repo_name/$repo_branch/splitted}"
+
+die() {
+  print -u2 -- "$program: $*"
+  exit 1
+}
+
+info() {
+  print -- "$program: $*"
+}
+
+script_dir="${0:A:h}"
+source_script="$script_dir/splitted"
+
+command -v curl >/dev/null 2>&1 || die "This installer needs curl, which normally comes with macOS."
+
+mkdir -p "$install_dir" || die "Could not create $install_dir"
+
+if [[ -f "$source_script" ]]; then
+  info "Installing from $source_script"
+  cp "$source_script" "$target" || die "Could not copy splitted to $target"
+else
+  temp_file="${TMPDIR:-/tmp}/splitted.$$"
+  info "Downloading splitted from $download_url"
+  curl -fsSL "$download_url" -o "$temp_file" || die "Could not download splitted from $download_url"
+  mv "$temp_file" "$target" || die "Could not install splitted to $target"
+fi
+
+chmod 755 "$target" || die "Could not make $target executable"
+
+if [[ ":$PATH:" != *":$install_dir:"* ]]; then
+  if [[ ! -f "$profile" ]] || ! grep -Fq '$HOME/.local/bin' "$profile" 2>/dev/null; then
+    {
+      print -- ""
+      print -- "# Added by the splitted installer"
+      print -- "$path_line"
+    } >> "$profile" || die "Could not update $profile"
+    info "Added $install_dir to PATH in $profile."
+  else
+    info "$install_dir already appears in $profile."
+  fi
+fi
+
+info "Installed splitted to $target."
+print -- ""
+print -- "Done. Open a new Terminal window, go to a folder of two-up photos, then run:"
+print -- "  splitted"

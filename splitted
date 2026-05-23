@@ -1,0 +1,324 @@
+#!/bin/zsh
+
+set -u
+set -o pipefail
+
+program="${0:t}"
+
+usage() {
+  cat <<'EOF'
+Split two-up photo scans into separate left and right images.
+
+Usage:
+  splitted [options] [INPUT]
+
+Run `splitted` from an image folder, or from a parent folder that contains the
+image folder. INPUT defaults to the current folder.
+
+By default, splitted scans folders recursively and creates a sibling folder
+called Splitted for the split photos.
+
+Options:
+  -o, --output DIR     Output folder. Default: a sibling folder named Splitted.
+  --no-recursive       Only process images directly in INPUT.
+  -f, --force          Overwrite existing output files.
+  -n, --dry-run        Show what would be created without writing files.
+  -h, --help           Show this help.
+
+Examples:
+  splitted
+  splitted --dry-run
+  splitted "/Users/nico/Downloads/W319785"
+  splitted "/Users/nico/Downloads/W319785/High Res"
+
+Output files are named like:
+  original_left.Tif
+  original_right.Tif
+EOF
+}
+
+die() {
+  print -u2 -- "$program: $*"
+  exit 1
+}
+
+warn() {
+  print -u2 -- "$program: $*"
+}
+
+is_supported_image() {
+  local path_lower="${1:l}"
+
+  case "$path_lower" in
+    *.jpg|*.jpeg|*.png|*.tif|*.tiff|*.heic|*.bmp|*.gif)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_inside_dir() {
+  local child="${1:a}"
+  local parent="${2:a}"
+
+  [[ "$child" == "$parent" || "$child" == "$parent"/* ]]
+}
+
+print_output_path() {
+  local dest_dir="$1"
+  local base="$2"
+  local ext="$3"
+  local side="$4"
+
+  if [[ -n "$ext" ]]; then
+    print -r -- "$dest_dir/${base}_${side}.${ext}"
+  else
+    print -r -- "$dest_dir/${base}_${side}"
+  fi
+}
+
+input_path=""
+output_dir=""
+integer recursive=1
+integer overwrite=0
+integer dry_run=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    -o|--output)
+      (( $# >= 2 )) || die "Missing folder after $1"
+      output_dir="$2"
+      shift 2
+      ;;
+    --no-recursive)
+      recursive=0
+      shift
+      ;;
+    -r|--recursive)
+      recursive=1
+      shift
+      ;;
+    -f|--force)
+      overwrite=1
+      shift
+      ;;
+    -n|--dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      [[ -z "$input_path" ]] || die "Unexpected extra argument: $1"
+      input_path="$1"
+      shift
+      ;;
+  esac
+done
+
+(( $# == 0 )) || die "Unexpected extra argument: $1"
+[[ -n "$input_path" ]] || input_path="."
+
+command -v sips >/dev/null 2>&1 || die "This script requires macOS's built-in sips command."
+
+input_path="${input_path:a}"
+[[ -e "$input_path" ]] || die "Input does not exist: $input_path"
+
+integer input_is_dir=0
+if [[ -d "$input_path" ]]; then
+  input_is_dir=1
+elif [[ ! -f "$input_path" ]]; then
+  die "Input must be a folder or image file: $input_path"
+fi
+
+typeset -a image_files
+
+if (( input_is_dir )); then
+  typeset -a find_args
+  find_args=("$input_path")
+
+  while IFS= read -r -d '' file; do
+    file="${file:a}"
+
+    if (( ! recursive )) && [[ "${file:h}" != "$input_path" ]]; then
+      continue
+    fi
+
+    # Avoid recursively splitting prior output when running from a parent folder.
+    [[ "$file" == */Splitted/* ]] && continue
+
+    if is_supported_image "$file"; then
+      image_files+=("$file")
+    fi
+  done < <(find "${find_args[@]}" -type f -print0)
+else
+  if is_supported_image "$input_path"; then
+    image_files+=("$input_path")
+  fi
+fi
+
+if (( ${#image_files} == 0 )); then
+  warn "No supported images found."
+  exit 1
+fi
+
+image_files=("${(@o)image_files}")
+
+single_image_dir="${image_files[1]:h}"
+integer all_in_one_dir=1
+for image_file in "${image_files[@]}"; do
+  if [[ "${image_file:h}" != "$single_image_dir" ]]; then
+    all_in_one_dir=0
+    break
+  fi
+done
+
+relative_base="$input_path"
+if (( all_in_one_dir )); then
+  relative_base="$single_image_dir"
+fi
+
+if [[ -z "$output_dir" ]]; then
+  if (( input_is_dir )); then
+    if (( all_in_one_dir )); then
+      output_dir="${single_image_dir:h}/Splitted"
+    else
+      output_dir="$input_path/Splitted"
+    fi
+  else
+    output_dir="${input_path:h}/Splitted"
+  fi
+fi
+output_dir="${output_dir:a}"
+
+if (( input_is_dir )) && [[ "$output_dir" == "$input_path" ]]; then
+  die "Output folder must be different from the input folder."
+fi
+
+typeset -a filtered_files
+for image_file in "${image_files[@]}"; do
+  if is_inside_dir "$image_file" "$output_dir"; then
+    continue
+  fi
+  filtered_files+=("$image_file")
+done
+image_files=("${filtered_files[@]}")
+
+if (( ${#image_files} == 0 )); then
+  warn "No supported images found outside the output folder."
+  exit 1
+fi
+
+if (( ! dry_run )); then
+  mkdir -p "$output_dir" || die "Could not create output folder: $output_dir"
+fi
+
+integer split=0
+integer skipped=0
+integer failed=0
+
+process_file() {
+  local file="$1"
+  local metadata width height left_width right_width
+  local relative relative_dir dest_dir name base ext left_out right_out
+
+  file="${file:a}"
+
+  metadata="$(sips -g pixelWidth -g pixelHeight "$file" 2>/dev/null)"
+  if [[ $? -ne 0 ]]; then
+    warn "Could not read image dimensions: $file"
+    (( failed++ ))
+    return 0
+  fi
+
+  width="$(print -r -- "$metadata" | awk '/pixelWidth:/ { print $2; exit }')"
+  height="$(print -r -- "$metadata" | awk '/pixelHeight:/ { print $2; exit }')"
+
+  if [[ -z "$width" || -z "$height" || "$width" != <-> || "$height" != <-> ]]; then
+    warn "Could not parse image dimensions: $file"
+    (( failed++ ))
+    return 0
+  fi
+
+  if (( width < 2 )); then
+    warn "Skipping image narrower than 2 pixels: $file"
+    (( skipped++ ))
+    return 0
+  fi
+
+  left_width=$(( width / 2 ))
+  right_width=$(( width - left_width ))
+
+  if is_inside_dir "$file" "$relative_base"; then
+    relative="${file#$relative_base/}"
+  else
+    relative="${file:t}"
+  fi
+
+  relative_dir="${relative:h}"
+  [[ "$relative_dir" == "." ]] && relative_dir=""
+
+  dest_dir="$output_dir"
+  if [[ -n "$relative_dir" ]]; then
+    dest_dir="$output_dir/$relative_dir"
+  fi
+
+  name="${file:t}"
+  base="${name:r}"
+  ext="${name:e}"
+  left_out="$(print_output_path "$dest_dir" "$base" "$ext" left)"
+  right_out="$(print_output_path "$dest_dir" "$base" "$ext" right)"
+
+  if (( ! overwrite )) && { [[ -e "$left_out" ]] || [[ -e "$right_out" ]] }; then
+    warn "Skipping existing output for $file (use --force to overwrite)."
+    (( skipped++ ))
+    return 0
+  fi
+
+  if (( dry_run )); then
+    print -- "Would split: $file"
+    print -- "  left:  $left_out (${left_width}x${height})"
+    print -- "  right: $right_out (${right_width}x${height})"
+    (( split++ ))
+    return 0
+  fi
+
+  mkdir -p "$dest_dir" || {
+    warn "Could not create output folder: $dest_dir"
+    (( failed++ ))
+    return 0
+  }
+
+  if sips --cropOffset 0 0 --cropToHeightWidth "$height" "$left_width" "$file" --out "$left_out" >/dev/null \
+    && sips --cropOffset 0 "$left_width" --cropToHeightWidth "$height" "$right_width" "$file" --out "$right_out" >/dev/null; then
+    print -- "Split ${file:t} -> ${left_out:t}, ${right_out:t}"
+    (( split++ ))
+  else
+    warn "Failed to split: $file"
+    (( failed++ ))
+  fi
+}
+
+for image_file in "${image_files[@]}"; do
+  process_file "$image_file"
+done
+
+if (( dry_run )); then
+  print -- "Dry run complete: $split image(s) would be split, $skipped skipped, $failed failed."
+else
+  print -- "Done: $split image(s) split, $skipped skipped, $failed failed."
+  print -- "Output folder: $output_dir"
+fi
+
+(( failed == 0 )) || exit 1
